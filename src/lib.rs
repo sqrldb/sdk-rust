@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use squirreldb::SquirrelDB;
+//! use squirreldb::{SquirrelDB, query::{table, field, SortDir}};
 //! use serde_json::json;
 //!
 //! #[tokio::main]
@@ -16,16 +16,20 @@
 //!     // Insert a document
 //!     let doc = client.insert("users", json!({
 //!         "name": "Alice",
-//!         "email": "alice@example.com"
+//!         "email": "alice@example.com",
+//!         "age": 25
 //!     })).await?;
 //!
 //!     println!("Inserted: {:?}", doc);
 //!
-//!     // Query documents
-//!     let users: Vec<serde_json::Value> = client.query(
-//!         r#"db.table("users").filter(u => u.name === "Alice").run()"#
-//!     ).await?;
+//!     // Query with native builder (find/sort/limit)
+//!     let query = table("users")
+//!         .find(field("age").gt(21.0))
+//!         .sort("name", SortDir::Asc)
+//!         .limit(10)
+//!         .compile();
 //!
+//!     let users: Vec<serde_json::Value> = client.query(&query).await?;
 //!     println!("Found: {:?}", users);
 //!
 //!     // Subscribe to changes
@@ -41,10 +45,16 @@
 mod client;
 mod error;
 pub mod protocol;
+pub mod query;
+pub mod storage;
 
 pub use client::{ConnectOptions, SquirrelDB, Subscription};
 pub use error::{Error, Result};
 pub use protocol::{
   ChangeEvent, ClientMessage, Document, Encoding, HandshakeStatus, MessageType, ProtocolFlags,
   ServerMessage, MAGIC, MAX_MESSAGE_SIZE, PROTOCOL_VERSION,
+};
+pub use query::{and, field, not, or, table, Field, Filter, QueryBuilder, SortDir, SortSpec};
+pub use storage::{
+  Bucket, MultipartUpload, Object, StorageClient, StorageError, StorageOptions, UploadPart,
 };

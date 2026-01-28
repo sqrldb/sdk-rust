@@ -1,0 +1,445 @@
+//! SquirrelDB Object Storage Client
+//!
+//! S3-compatible storage operations
+
+use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
+use reqwest::{Client, StatusCode};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Storage bucket
+#[derive(Debug, Clone)]
+pub struct Bucket {
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Storage object
+#[derive(Debug, Clone)]
+pub struct Object {
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    pub last_modified: DateTime<Utc>,
+    pub content_type: Option<String>,
+}
+
+/// Multipart upload info
+#[derive(Debug, Clone)]
+pub struct MultipartUpload {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+}
+
+/// Uploaded part
+#[derive(Debug, Clone)]
+pub struct UploadPart {
+    pub part_number: u32,
+    pub etag: String,
+}
+
+/// Storage client options
+pub struct StorageOptions {
+    pub endpoint: String,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub region: String,
+}
+
+impl Default for StorageOptions {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:9000".to_string(),
+            access_key: None,
+            secret_key: None,
+            region: "us-east-1".to_string(),
+        }
+    }
+}
+
+/// SquirrelDB Object Storage client
+pub struct StorageClient {
+    endpoint: String,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    region: String,
+    client: Client,
+}
+
+impl StorageClient {
+    /// Create a new storage client
+    pub fn new(opts: StorageOptions) -> Self {
+        Self {
+            endpoint: opts.endpoint.trim_end_matches('/').to_string(),
+            access_key: opts.access_key,
+            secret_key: opts.secret_key,
+            region: opts.region,
+            client: Client::new(),
+        }
+    }
+
+    fn sign_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &mut BTreeMap<String, String>,
+        payload_hash: &str,
+    ) {
+        let (access_key, secret_key) = match (&self.access_key, &self.secret_key) {
+            (Some(ak), Some(sk)) => (ak, sk),
+            _ => return,
+        };
+
+        let now = Utc::now();
+        let date_stamp = now.format("%Y%m%d").to_string();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+
+        headers.insert("x-amz-date".to_string(), amz_date.clone());
+        headers.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+
+        // Canonical request
+        let canonical_uri = urlencoding::encode(path);
+        let canonical_querystring = "";
+
+        let mut signed_headers: Vec<&str> = headers.keys().map(|s| s.as_str()).collect();
+        signed_headers.push("host");
+        signed_headers.sort();
+        let signed_headers_str = signed_headers.join(";");
+
+        let host = self.endpoint.trim_start_matches("http://").trim_start_matches("https://");
+        let mut canonical_headers = String::new();
+        for h in &signed_headers {
+            if *h == "host" {
+                canonical_headers.push_str(&format!("host:{}\n", host));
+            } else if let Some(v) = headers.get(*h) {
+                canonical_headers.push_str(&format!("{}:{}\n", h, v));
+            }
+        }
+
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method,
+            canonical_uri,
+            canonical_querystring,
+            canonical_headers,
+            signed_headers_str,
+            payload_hash
+        );
+
+        // String to sign
+        let algorithm = "AWS4-HMAC-SHA256";
+        let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, self.region);
+        let hash = Sha256::digest(canonical_request.as_bytes());
+        let string_to_sign = format!(
+            "{}\n{}\n{}\n{:x}",
+            algorithm, amz_date, credential_scope, hash
+        );
+
+        // Signature
+        fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+
+        let k_date = hmac_sha256(format!("AWS4{}", secret_key).as_bytes(), date_stamp.as_bytes());
+        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
+        let k_service = hmac_sha256(&k_region, b"s3");
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+        // Authorization header
+        let auth_header = format!(
+            "{} Credential={}/{}, SignedHeaders={}, Signature={}",
+            algorithm, access_key, credential_scope, signed_headers_str, signature
+        );
+        headers.insert("Authorization".to_string(), auth_header);
+    }
+
+    /// List all buckets
+    pub async fn list_buckets(&self) -> Result<Vec<Bucket>, StorageError> {
+        let mut headers = BTreeMap::new();
+        self.sign_request("GET", "/", &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.get(&format!("{}/", self.endpoint));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        let text = resp.text().await.map_err(StorageError::Http)?;
+
+        // Simple XML parsing
+        let mut buckets = Vec::new();
+        for cap in regex::Regex::new(r"<Name>([^<]+)</Name>")
+            .unwrap()
+            .captures_iter(&text)
+        {
+            buckets.push(Bucket {
+                name: cap[1].to_string(),
+                created_at: Utc::now(),
+            });
+        }
+
+        Ok(buckets)
+    }
+
+    /// Create a bucket
+    pub async fn create_bucket(&self, name: &str) -> Result<(), StorageError> {
+        let path = format!("/{}", name);
+        let mut headers = BTreeMap::new();
+        self.sign_request("PUT", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.put(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() && resp.status() != StatusCode::OK {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a bucket
+    pub async fn delete_bucket(&self, name: &str) -> Result<(), StorageError> {
+        let path = format!("/{}", name);
+        let mut headers = BTreeMap::new();
+        self.sign_request("DELETE", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.delete(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() && resp.status() != StatusCode::NO_CONTENT {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Check if bucket exists
+    pub async fn bucket_exists(&self, name: &str) -> Result<bool, StorageError> {
+        let path = format!("/{}", name);
+        let mut headers = BTreeMap::new();
+        self.sign_request("HEAD", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.head(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        Ok(resp.status() == StatusCode::OK)
+    }
+
+    /// List objects in a bucket
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        max_keys: Option<u32>,
+    ) -> Result<Vec<Object>, StorageError> {
+        let path = format!("/{}", bucket);
+        let mut url = format!("{}{}", self.endpoint, path);
+
+        let mut params = Vec::new();
+        if let Some(p) = prefix {
+            params.push(format!("prefix={}", urlencoding::encode(p)));
+        }
+        if let Some(m) = max_keys {
+            params.push(format!("max-keys={}", m));
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+
+        let mut headers = BTreeMap::new();
+        self.sign_request("GET", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.get(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        let text = resp.text().await.map_err(StorageError::Http)?;
+
+        // Simple XML parsing
+        let mut objects = Vec::new();
+        let re = regex::Regex::new(r"<Key>([^<]+)</Key>.*?<Size>(\d+)</Size>.*?<ETag>([^<]+)</ETag>")
+            .unwrap();
+        for cap in re.captures_iter(&text) {
+            objects.push(Object {
+                key: cap[1].to_string(),
+                size: cap[2].parse().unwrap_or(0),
+                etag: cap[3].trim_matches('"').to_string(),
+                last_modified: Utc::now(),
+                content_type: None,
+            });
+        }
+
+        Ok(objects)
+    }
+
+    /// Get object content
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, StorageError> {
+        let path = format!("/{}/{}", bucket, key);
+        let mut headers = BTreeMap::new();
+        self.sign_request("GET", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.get(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        resp.bytes().await.map(|b| b.to_vec()).map_err(StorageError::Http)
+    }
+
+    /// Put object
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<String, StorageError> {
+        let path = format!("/{}/{}", bucket, key);
+        let payload_hash = hex::encode(Sha256::digest(data));
+
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            content_type.unwrap_or("application/octet-stream").to_string(),
+        );
+        headers.insert("Content-Length".to_string(), data.len().to_string());
+        self.sign_request("PUT", &path, &mut headers, &payload_hash);
+
+        let mut req = self.client.put(&format!("{}{}", self.endpoint, path)).body(data.to_vec());
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        Ok(resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string())
+    }
+
+    /// Delete object
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+        let path = format!("/{}/{}", bucket, key);
+        let mut headers = BTreeMap::new();
+        self.sign_request("DELETE", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.delete(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() && resp.status() != StatusCode::NO_CONTENT {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Copy object
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<String, StorageError> {
+        let path = format!("/{}/{}", dst_bucket, dst_key);
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "x-amz-copy-source".to_string(),
+            format!("/{}/{}", src_bucket, src_key),
+        );
+        self.sign_request("PUT", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.put(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        if !resp.status().is_success() {
+            return Err(StorageError::Status(resp.status()));
+        }
+
+        Ok(resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string())
+    }
+
+    /// Check if object exists
+    pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
+        let path = format!("/{}/{}", bucket, key);
+        let mut headers = BTreeMap::new();
+        self.sign_request("HEAD", &path, &mut headers, "UNSIGNED-PAYLOAD");
+
+        let mut req = self.client.head(&format!("{}{}", self.endpoint, path));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(StorageError::Http)?;
+        Ok(resp.status() == StatusCode::OK)
+    }
+}
+
+/// Storage error type
+#[derive(Debug)]
+pub enum StorageError {
+    Http(reqwest::Error),
+    Status(StatusCode),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageError::Http(e) => write!(f, "HTTP error: {}", e),
+            StorageError::Status(s) => write!(f, "HTTP status: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
