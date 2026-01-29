@@ -42,6 +42,7 @@
 //! }
 //! ```
 
+pub mod cache;
 mod client;
 mod error;
 pub mod protocol;
@@ -58,3 +59,4 @@ pub use query::{and, field, not, or, table, Field, Filter, QueryBuilder, SortDir
 pub use storage::{
   Bucket, MultipartUpload, Object, StorageClient, StorageError, StorageOptions, UploadPart,
 };
+pub use cache::{CacheClient, CacheError, CacheOptions, RespValue};

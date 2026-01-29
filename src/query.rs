@@ -2,7 +2,9 @@
 //!
 //! Provides a fluent API for building queries using MongoDB-like naming: find/sort/limit
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fmt;
 
 /// Sort direction
@@ -22,10 +24,34 @@ impl fmt::Display for SortDir {
 }
 
 /// Sort specification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortSpec {
     pub field: String,
-    pub direction: SortDir,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+}
+
+/// Changes subscription options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesSpec {
+    #[serde(rename = "includeInitial", default)]
+    pub include_initial: bool,
+}
+
+/// Structured query object sent over the wire
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredQuery {
+    pub table: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Vec<SortSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ChangesSpec>,
 }
 
 /// Filter condition for queries
@@ -93,6 +119,70 @@ impl Filter {
                 format!("!({})", condition.compile())
             }
         }
+    }
+
+    /// Convert filter to structured query format
+    fn to_structured(&self) -> HashMap<String, serde_json::Value> {
+        let mut result = HashMap::new();
+        match self {
+            Filter::Eq(field, value) => {
+                result.insert(field.clone(), json!({"$eq": value}));
+            }
+            Filter::Ne(field, value) => {
+                result.insert(field.clone(), json!({"$ne": value}));
+            }
+            Filter::Gt(field, value) => {
+                result.insert(field.clone(), json!({"$gt": value}));
+            }
+            Filter::Gte(field, value) => {
+                result.insert(field.clone(), json!({"$gte": value}));
+            }
+            Filter::Lt(field, value) => {
+                result.insert(field.clone(), json!({"$lt": value}));
+            }
+            Filter::Lte(field, value) => {
+                result.insert(field.clone(), json!({"$lte": value}));
+            }
+            Filter::In(field, values) => {
+                result.insert(field.clone(), json!({"$in": values}));
+            }
+            Filter::NotIn(field, values) => {
+                result.insert(field.clone(), json!({"$nin": values}));
+            }
+            Filter::Contains(field, value) => {
+                result.insert(field.clone(), json!({"$contains": value}));
+            }
+            Filter::StartsWith(field, value) => {
+                result.insert(field.clone(), json!({"$startsWith": value}));
+            }
+            Filter::EndsWith(field, value) => {
+                result.insert(field.clone(), json!({"$endsWith": value}));
+            }
+            Filter::Exists(field, value) => {
+                result.insert(field.clone(), json!({"$exists": value}));
+            }
+            Filter::And(conditions) => {
+                let structured: Vec<serde_json::Value> = conditions
+                    .iter()
+                    .map(|c| serde_json::to_value(c.to_structured()).unwrap_or_default())
+                    .collect();
+                result.insert("$and".to_string(), json!(structured));
+            }
+            Filter::Or(conditions) => {
+                let structured: Vec<serde_json::Value> = conditions
+                    .iter()
+                    .map(|c| serde_json::to_value(c.to_structured()).unwrap_or_default())
+                    .collect();
+                result.insert("$or".to_string(), json!(structured));
+            }
+            Filter::Not(condition) => {
+                result.insert(
+                    "$not".to_string(),
+                    serde_json::to_value(condition.to_structured()).unwrap_or_default(),
+                );
+            }
+        }
+        result
     }
 }
 
@@ -244,7 +334,7 @@ impl QueryBuilder {
         self
     }
 
-    /// Compile to SquirrelDB JS query string
+    /// Compile to SquirrelDB JS query string (legacy)
     pub fn compile(&self) -> String {
         let mut query = format!(r#"db.table("{}")"#, self.table_name);
 
@@ -278,6 +368,42 @@ impl QueryBuilder {
         }
 
         query
+    }
+
+    /// Compile to structured query object (preferred, no JS evaluation on server)
+    pub fn compile_structured(&self) -> StructuredQuery {
+        let filter = self.filter.as_ref().map(|f| f.to_structured());
+
+        let sort = if self.sort_specs.is_empty() {
+            None
+        } else {
+            Some(
+                self.sort_specs
+                    .iter()
+                    .map(|s| SortSpec {
+                        field: s.field.clone(),
+                        direction: Some(s.direction.to_string()),
+                    })
+                    .collect(),
+            )
+        };
+
+        let changes = if self.is_changes {
+            Some(ChangesSpec {
+                include_initial: false,
+            })
+        } else {
+            None
+        };
+
+        StructuredQuery {
+            table: self.table_name.clone(),
+            filter,
+            sort,
+            limit: self.limit_value,
+            skip: self.skip_value,
+            changes,
+        }
     }
 }
 
