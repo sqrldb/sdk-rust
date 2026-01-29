@@ -271,7 +271,7 @@ pub fn not(filter: Filter) -> Filter {
 ///
 /// # Example
 /// ```
-/// use squirreldb::query::{QueryBuilder, field};
+/// use squirreldb::query::{QueryBuilder, field, SortDir};
 ///
 /// let query = QueryBuilder::table("users")
 ///     .find(field("age").gt(21.0))
@@ -311,7 +311,7 @@ impl QueryBuilder {
     pub fn sort(mut self, field: impl Into<String>, direction: SortDir) -> Self {
         self.sort_specs.push(SortSpec {
             field: field.into(),
-            direction,
+            direction: Some(direction.to_string()),
         });
         self
     }
@@ -343,11 +343,11 @@ impl QueryBuilder {
         }
 
         for spec in &self.sort_specs {
-            match spec.direction {
-                SortDir::Desc => {
+            match spec.direction.as_deref() {
+                Some("desc") => {
                     query.push_str(&format!(r#".orderBy("{}", "desc")"#, spec.field));
                 }
-                SortDir::Asc => {
+                _ => {
                     query.push_str(&format!(r#".orderBy("{}")"#, spec.field));
                 }
             }
@@ -382,7 +382,7 @@ impl QueryBuilder {
                     .iter()
                     .map(|s| SortSpec {
                         field: s.field.clone(),
-                        direction: Some(s.direction.to_string()),
+                        direction: s.direction.clone(),
                     })
                     .collect(),
             )
