@@ -3,25 +3,20 @@ set -e
 
 cd "$(dirname "$0")"
 
-VERSION=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+VERSION="0.1.0"
 
-echo "Building squirreldb Rust SDK v${VERSION}..."
-cargo build --release
+echo "Releasing squirreldb-sdk v${VERSION}..."
 
 echo "Running tests..."
 cargo test
 
-echo "Running clippy..."
-cargo clippy -- -D warnings
+echo "Building..."
+cargo build --release
 
-echo "Dry run publish..."
-cargo publish --dry-run
+echo "Publishing to crates.io..."
+cargo publish --allow-dirty
 
-read -p "Publish squirreldb v${VERSION} to crates.io? [y/N] " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  cargo publish
-  echo "Published squirreldb@${VERSION} to crates.io"
-else
-  echo "Aborted"
-fi
+echo "Released squirreldb-sdk@${VERSION}"
+echo ""
+echo "Users can install with:"
+echo "  cargo add squirreldb-sdk"

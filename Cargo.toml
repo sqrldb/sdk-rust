@@ -1,10 +1,10 @@
 [package]
-name = "squirreldb"
-version = "0.0.1"
+name = "squirreldb-sdk"
+version = "0.1.0"
 edition = "2021"
 description = "Rust client SDK for SquirrelDB"
 license = "MIT"
-repository = "https://github.com/user/squirreldb"
+repository = "https://github.com/squirreldb/squirreldb"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros"] }
@@ -14,7 +14,6 @@ rmp-serde = "1.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 futures = "0.3"
-# Storage dependencies
 reqwest = { version = "0.12", features = ["json"] }
 sha2 = "0.10"
 hmac = "0.12"
@@ -25,7 +24,3 @@ regex = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-
-[[example]]
-name = "basic"
-path = "examples/basic.rs"
